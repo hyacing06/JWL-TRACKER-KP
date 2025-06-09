@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>JWL Tracker</title>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+  <!-- Load Google API script async with onload handler -->
+  <script async defer src="https://apis.google.com/js/api.js" onload="handleClientLoad()"></script>
+
+  <style>
+    body {
+      font-family: 'Segoe UI', sans-serif;
+      background: #f9fafb;
+      margin: 0;
+      padding: 20px;
+    }
+
+    h2 {
+      margin-bottom: 10px;
+      color: #2c3e50;
+    }
+
+    .action-buttons {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 15px;
+      align-items: center;
+    }
+
+    button, select, input[type="text"], input[type="file"] {
+      padding: 6px 12px;
+      border-radius: 8px;
+      border: 1px solid #ccc;
+      font-size: 14px;
+    }
+
+    button {
+      background: #4CAF50;
+      color: white;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    button:hover {
+      background: #45a049;
+    }
+
+    button.danger {
+      background: #e74c3c;
+    }
+
+    button.danger:hover {
+      background: #c0392b;
+    }
+
+    button.secondary {
+      background: #3498db;
+    }
+
+    button.secondary:hover {
+      background: #2980b9;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: white;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    thead th {
+      background-color: #dfe6e9;
+      color: #2d3436;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      padding: 10px;
+    }
+
+    td, th {
+      border: 1px solid #ccc;
+      padding: 8px;
+      text-align: left;
+    }
+
+    tbody tr:hover {
+      background-color: #f1f2f6;
+    }
+
+    input[type="checkbox"] {
+      transform: scale(1.2);
+    }
+
+    input[type="text"], input[type="number"], select {
+      width: 100%;
+      box-sizing: border-box;
+    }
+
+    .saved-indicator {
+      color: green;
+      font-weight: bold;
+      font-size: 0.9em;
+    }
+
+    .toggle {
+      cursor: pointer;
+    }
+
+    @media (max-width: 768px) {
+      .action-buttons {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+    }
+  </style>
+</head>
+<body>
+  <h2>JWL Tracker</h2>
+
+  <div class="action-buttons">
+    <input type="file" id="fileInput" />
+    <button class="secondary" onclick="exportToExcel()">Export</button>
+    <button class="secondary" onclick="undoLast()">Undo</button>
+    <button onclick="addRow()">Add Row</button>
+    <label>CSR Rep:</label>
+    <select id="repSelect"></select>
+    <input type="text" id="newRep" placeholder="Add rep name" />
+    <button onclick="addRep()">Add Rep</button>
+    <button class="danger" onclick="removeRep()">Remove Selected Rep</button>
+    <button id="saveToSheetBtn" onclick="authenticateAndSave()" disabled>Save to Google Sheet</button>
+    <span class="saved-indicator" id="saveStatus"></span>
+  </div>
+
+  <table id="dataTable"></table>
+
+  <script>
+    const headers = ["Date", "Order ID", "Marketplace", "Reduced Dim?", "JWL Sent?", "Date JWL Template Sent", "Amount Refunded", "Refund Issued?", "CSR Rep", "Reason of JWL", "SKU", "Notes"];
+    let tableData = [];
+    let history = [];
+    let csrReps = [];
+    let currentRep = '';
+
+    const fileInput = document.getElementById('fileInput');
+    const dataTable = document.getElementById('dataTable');
+    const repSelect = document.getElementById('repSelect');
+    const saveStatus = document.getElementById('saveStatus');
+    const saveToSheetBtn = document.getElementById('saveToSheetBtn');
+
+    // Google API config
+    const CLIENT_ID = '631340564410-40tb6pccifnrev0rgttcjsc42v1a65lv.apps.googleusercontent.com';
+    const API_KEY = 'AIzaSyDjfA-uKRoDI-eE-4Q_UaIm_6k9tS0Byu0';  // replace with your actual key if needed
+    const DISCOVERY_DOCS = ["https://sheets.googleapis.com/$discovery/rest?version=v4"];
+    const SCOPES = "https://www.googleapis.com/auth/spreadsheets";
+
+    const SPREADSHEET_ID = '19IRKLzt4Vj5dBgoOwZ_SWFsPNWjkOczFt3UKk6sLnPM';
+    const SHEET_NAME = 'Sheet1'; // adjust if needed
+
+    let gapiInited = false;
+    let gisInited = false;
+    let tokenClient;
+
+    // ========== Google API Initialization ==========
+    function handleClientLoad() {
+      gapi.load('client', initializeGapiClient);
+      // Initialize Google Identity Services client for OAuth2
+      gisInited = true;
+      tokenClient = google.accounts.oauth2.initTokenClient({
+        client_id: CLIENT_ID,
+        scope: SCOPES,
+        callback: '', // set later
+      });
+      maybeEnableButtons();
+    }
+
+    async function initializeGapiClient() {
+      await gapi.client.init({
+        apiKey: API_KEY,
+        discoveryDocs: DISCOVERY_DOCS,
+      });
+      gapiInited = true;
+      maybeEnableButtons();
+    }
+
+    function maybeEnableButtons() {
+      if (gapiInited && gisInited) {
+        saveToSheetBtn.disabled = false;
+      }
+    }
+
+    // Called when clicking "Save to Google Sheet"
+    function authenticateAndSave() {
+      if (!gapiInited || !gisInited) {
+        alert("Google API not initialized yet.");
+        return;
+      }
+
+      tokenClient.callback = async (resp) => {
+        if (resp.error !== undefined) {
+          console.error(resp);
+          alert("Error during authentication: " + resp.error);
+          return;
+        }
+        await saveDataToSheet();
+      };
+
+      if (!gapi.client.getToken()) {
+        // Prompt user to authorize
+        tokenClient.requestAccessToken({ prompt: 'consent' });
+      } else {
+        saveDataToSheet();
+      }
+    }
+
+    async function saveDataToSheet() {
+      // Combine CSR reps as a string in a separate row at bottom
+      const csrRepsRow = ['CSR Reps', ...csrReps];
+
+      // Data rows: all table data rows mapped to values
+      const values = tableData.map(row => headers.map(h => row[h]));
+
+      // Prepare value range to write headers + table data + CSR reps
+      const valueRangeBody = {
+        values: [headers, ...values, [], csrRepsRow],
+      };
+
+      const params = {
+        spreadsheetId: SPREADSHEET_ID,
+        range: `${SHEET_NAME}!A1`,
+        valueInputOption: 'USER_ENTERED',
+      };
+
+      try {
+        const response = await gapi.client.sheets.spreadsheets.values.update(params, valueRangeBody);
+        console.log('Google Sheets updated:', response);
+        saveStatus.textContent = "✅ Saved to Google Sheets";
+        setTimeout(() => (saveStatus.textContent = ''), 2000);
+      } catch (err) {
+        console.error('Error updating sheet:', err);
+        alert("Error saving to Google Sheets: " + err.message);
+      }
+    }
+
+    // ========== Main App Logic ==========
+
+    fileInput.addEventListener('change', e => {
+      if (e.target.files.length === 0) return;
+      const file = e.target.files[0];
+      const reader = new FileReader();
+      reader.onload = function (evt) {
+        const data = new Uint8Array(evt.target.result);
+        const workbook = XLSX.read(data, { type: 'array' });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const parsed = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+        const today = new Date().toISOString().split('T')[0];
+        const shouldReplace = confirm("Do you want to REPLACE the existing data? Click Cancel to APPEND.");
+
+        const newData = parsed.map(row => {
+          const rowData = {};
+          headers.forEach(h => {
+            const match = Object.keys(row).find(k => k.toLowerCase().includes(h.toLowerCase()));
+            rowData[h] = match ? row[match] : '';
+          });
+          rowData['Date'] = today;
+          rowData['Date JWL Template Sent'] = rowData['JWL Sent?'].toLowerCase() === 'yes' ? today : '';
+          rowData['CSR Rep'] = currentRep;
+          return rowData;
+        });
+
+        if (shouldReplace) tableData = newData;
+        else tableData.push(...newData);
+
+        saveData();
+        renderTable();
+        autoSaveToSheet();
+      };
+      reader.readAsArrayBuffer(file);
+    });
+
+    function renderTable() {
+      dataTable.innerHTML = '';
+      const thead = document.createElement('thead');
+      const headRow = document.createElement('tr');
+      headers.forEach(h => {
+        const th = document.createElement('th');
+        th.textContent = h;
+        headRow.appendChild(th);
+      });
+      const thDelete = document.createElement('th');
+      thDelete.textContent = 'Actions';
+      headRow.appendChild(thDelete);
+      thead.appendChild(headRow);
+      dataTable.appendChild(thead);
+
+      const tbody = document.createElement('tbody');
+      tableData.forEach((row, i) => {
+        const tr = document.createElement('tr');
+        headers.forEach(h => {
+          const td = document.createElement('td');
+
+          if (h === "Reduced Dim?" || h === "JWL Sent?" || h === "Refund Issued?") {
+  const checkbox = document.createElement('input');
+  checkbox.type = 'checkbox';
+  checkbox.checked = row[h].toString().toLowerCase() === 'yes' || row[h] === true;
+  checkbox.addEventListener('change', () => {
+    row[h] = checkbox.checked ? 'Yes' : 'No';
+
+    // Auto-populate Date JWL Template Sent
+    if (h === "JWL Sent?" && checkbox.checked) {
+      const today = new Date().toISOString().split('T')[0];
+      row["Date JWL Template Sent"] = today;
+    }
+
+    saveData();
+    renderTable(); // Re-render to show new date
+    autoSaveToSheet();
+  });
+  td.appendChild(checkbox);
+          } else if (h === "CSR Rep") {
+            const select = document.createElement('select');
+            csrReps.forEach(rep => {
+              const option = document.createElement('option');
+              option.value = rep;
+              option.textContent = rep;
+              select.appendChild(option);
+            });
+            select.value = row[h];
+            select.addEventListener('change', () => {
+              row[h] = select.value;
+              saveData();
+              autoSaveToSheet();
+            });
+            td.appendChild(select);
+          } else {
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.value = row[h];
+            input.addEventListener('input', () => {
+              row[h] = input.value;
+              saveData();
+              autoSaveToSheet();
+            });
+            td.appendChild(input);
+          }
+          tr.appendChild(td);
+        });
+
+        const tdDelete = document.createElement('td');
+        const delBtn = document.createElement('button');
+        delBtn.textContent = 'Delete';
+        delBtn.classList.add('danger');
+        delBtn.addEventListener('click', () => {
+          if (confirm('Delete this row?')) {
+            tableData.splice(i, 1);
+            saveData();
+            renderTable();
+            autoSaveToSheet();
+          }
+        });
+        tdDelete.appendChild(delBtn);
+        tr.appendChild(tdDelete);
+        tbody.appendChild(tr);
+      });
+
+      dataTable.appendChild(tbody);
+    }
+
+    function saveData() {
+      localStorage.setItem('tableData', JSON.stringify(tableData));
+      localStorage.setItem('csrReps', JSON.stringify(csrReps));
+      localStorage.setItem('currentRep', currentRep);
+      addHistory();
+    }
+
+    function addHistory() {
+      history.push(JSON.stringify(tableData));
+      if (history.length > 20) history.shift();
+    }
+
+    function undoLast() {
+      if (history.length < 2) return alert("Nothing to undo");
+      history.pop();
+      tableData = JSON.parse(history[history.length - 1]);
+      saveData();
+      renderTable();
+      autoSaveToSheet();
+    }
+
+    function addRow() {
+      const emptyRow = {};
+      headers.forEach(h => emptyRow[h] = '');
+      emptyRow['CSR Rep'] = currentRep;
+      tableData.push(emptyRow);
+      saveData();
+      renderTable();
+      autoSaveToSheet();
+    }
+
+    // CSR Rep functions
+    function renderReps() {
+      repSelect.innerHTML = '';
+      csrReps.forEach(rep => {
+        const option = document.createElement('option');
+        option.value = rep;
+        option.textContent = rep;
+        repSelect.appendChild(option);
+      });
+      repSelect.value = currentRep || (csrReps.length ? csrReps[0] : '');
+    }
+
+    function addRep() {
+      const name = document.getElementById('newRep').value.trim();
+      if (!name) return alert("Enter a name");
+      if (csrReps.includes(name)) return alert("Rep already exists");
+      csrReps.push(name);
+      currentRep = name;
+      document.getElementById('newRep').value = '';
+      renderReps();
+      saveData();
+      autoSaveToSheet();
+    }
+
+    function removeRep() {
+      const rep = repSelect.value;
+      if (!rep) return alert("Select a rep to remove");
+      if (!confirm(`Remove ${rep}?`)) return;
+      csrReps = csrReps.filter(r => r !== rep);
+      currentRep = csrReps.length ? csrReps[0] : '';
+      renderReps();
+      // Also remove rep from any row
+      tableData.forEach(row => {
+        if (row['CSR Rep'] === rep) row['CSR Rep'] = '';
+      });
+      saveData();
+      renderTable();
+      autoSaveToSheet();
+    }
+
+    repSelect.addEventListener('change', () => {
+      currentRep = repSelect.value;
+      saveData();
+    });
+
+    // Export to Excel
+    function exportToExcel() {
+      const wb = XLSX.utils.book_new();
+      const wsData = [headers];
+      tableData.forEach(row => {
+        wsData.push(headers.map(h => row[h]));
+      });
+      const ws = XLSX.utils.aoa_to_sheet(wsData);
+      XLSX.utils.book_append_sheet(wb, ws, 'JWL Tracker');
+      XLSX.writeFile(wb, 'jwl_tracker.xlsx');
+    }
+
+    // Auto-save to Google Sheet after edits (debounced)
+    let autoSaveTimeout;
+    function autoSaveToSheet() {
+      clearTimeout(autoSaveTimeout);
+      autoSaveTimeout = setTimeout(() => {
+        if (!gapiInited || !gisInited) return; // API not ready
+        if (!gapi.client.getToken()) {
+          // skip auto save if not authorized yet
+          return;
+        }
+        saveDataToSheet();
+      }, 2000);
+    }
+
+    // Init app
+    window.onload = function () {
+      tableData = JSON.parse(localStorage.getItem('tableData')) || [];
+      csrReps = JSON.parse(localStorage.getItem('csrReps')) || [];
+      currentRep = localStorage.getItem('currentRep') || (csrReps.length ? csrReps[0] : '');
+      renderReps();
+      renderTable();
+
+      // Initialize Google OAuth client (for token client)
+      if (typeof google !== "undefined" && google.accounts && google.accounts.oauth2) {
+        gisInited = true;
+        tokenClient = google.accounts.oauth2.initTokenClient({
+          client_id: CLIENT_ID,
+          scope: SCOPES,
+          callback: '', // will be set later
+        });
+        maybeEnableButtons();
+      }
+    };
+  </script>
+
+  <!-- Load Google Identity Services for OAuth -->
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+</body>
+</html>
